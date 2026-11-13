@@ -48,9 +48,10 @@ differs from `crates/gpui_macos/src` at `v0.1.14` only by a licence header line.
 On macOS 27 (Apple silicon), with FAIM's macOS app built against this branch:
 `GPUI_LAUNCH_TRACE=1` shows the launch callback starting right after
 `finishLaunching`, and with `defer_initial_window_show` the window is ordered and its
-first frame presented inside one transaction. The drag code compiles without
-warnings and its `msg_send!` return types match objc2's debug-build checks, but no
-real drag has been dropped on a window.
+first frame presented inside one transaction. In a macOS 27.2.1 VM, driven through
+cua with a probe window that logs drops (FAIM's `gui/crates/faim-gui-macos/vm/`), a
+Safari link arrived as its URL, a Safari image hovered over the window wrote nothing
+and dropped on it was written as a valid PNG, and a Finder file arrived as its path.
 
 ## Updating
 
