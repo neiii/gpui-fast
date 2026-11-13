@@ -1014,6 +1014,9 @@ pub(crate) struct MacWindow(
 
 thread_local! {
     static DEFER_INITIAL_SHOW: Cell<bool> = const { Cell::new(false) };
+    /// Set once the launch callback has returned, when nothing would show a
+    /// deferred window any more.
+    static LAUNCHED: Cell<bool> = const { Cell::new(false) };
     static INITIAL_WINDOWS: std::cell::RefCell<Vec<(Weak<Mutex<MacWindowState>>, bool)>> =
         Default::default();
 }
@@ -1022,17 +1025,22 @@ thread_local! {
 /// window. GPUI's callback must return (releasing its App borrow) before the
 /// fork orders and requests presentation of the synchronously built scene.
 /// Untabbed normal windows only; hidden/popup/tabbed-window behavior is unchanged.
+/// Called after the launch callback has returned, it does nothing: only the launch
+/// path shows deferred windows, so a window deferred later would stay hidden.
 pub fn defer_initial_window_show() {
     assert!(
         crate::main_thread_marker().is_some(),
         "initial show requires main thread"
     );
-    DEFER_INITIAL_SHOW.with(|defer| defer.set(true));
+    if !LAUNCHED.with(Cell::get) {
+        DEFER_INITIAL_SHOW.with(|defer| defer.set(true));
+    }
 }
 
 /// Orders each window `defer_initial_window_show` held back and draws its first
 /// frame in the same `CATransaction`, so the window never appears empty.
 pub(crate) fn show_initial_windows() {
+    LAUNCHED.with(|launched| launched.set(true));
     DEFER_INITIAL_SHOW.with(|defer| defer.set(false));
     let windows = INITIAL_WINDOWS.with(|windows| mem::take(&mut *windows.borrow_mut()));
     for (window, focus) in windows {
