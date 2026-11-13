@@ -538,7 +538,9 @@ impl Platform for MacPlatform {
         }
 
         unsafe {
+            crate::launch_trace::phase("sharedApplication_begin");
             let app: *mut AnyObject = msg_send![APP_CLASS, sharedApplication];
+            crate::launch_trace::phase("sharedApplication_end");
             // An accessory app must not register in the Dock during launch, so its
             // policy has to precede the run loop. `Regular` is applied in
             // `did_finish_launching` instead: setting it this early leaves the menu
@@ -570,10 +572,14 @@ impl Platform for MacPlatform {
             // when it has already happened; the delegate's
             // `did_finish_launching` still installs its observers when the
             // event lands, and finds no callback left to run.
+            crate::launch_trace::phase("finishLaunching_begin");
             let _: () = msg_send![app, finishLaunching];
+            crate::launch_trace::phase("finishLaunching_end");
             let callback = self.0.lock().finish_launching.take();
             if let Some(callback) = callback {
+                crate::launch_trace::phase("app_callback_begin");
                 callback();
+                crate::launch_trace::phase("app_callback_end");
             }
             autoreleasepool(|_| {
                 let _: () = msg_send![app, run];
@@ -1390,7 +1396,9 @@ extern "C-unwind" fn did_finish_launching(this: &AnyObject, _: Sel, _: *mut AnyO
             state.finish_launching.take()
         };
         if let Some(callback) = callback {
+            crate::launch_trace::phase("app_callback_begin");
             callback();
+            crate::launch_trace::phase("app_callback_end");
         }
     }
 }

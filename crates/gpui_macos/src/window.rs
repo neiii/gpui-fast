@@ -1132,6 +1132,7 @@ impl MacWindow {
                 ),
             );
 
+            crate::launch_trace::phase("NSWindow_init_begin");
             let native_window: *mut AnyObject = msg_send![
                 native_window,
                 initWithContentRect: window_rect,
@@ -1140,6 +1141,7 @@ impl MacWindow {
                 defer: Bool::NO,
                 screen: target_screen.as_deref()
             ];
+            crate::launch_trace::phase("NSWindow_init_end");
             assert!(!native_window.is_null());
             #[expect(
                 deprecated,
@@ -1368,12 +1370,14 @@ impl MacWindow {
                 }
             }
 
+            crate::launch_trace::phase("orderFront_begin");
             if focus && show {
                 let _: () =
                     msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
             } else if show {
                 let _: () = msg_send![native_window, orderFront: ptr::null_mut::<AnyObject>()];
             }
+            crate::launch_trace::phase("orderFront_end");
 
             // Set the initial position of the window to the specified origin.
             // Although we already specified the position using `initWithContentRect_styleMask_backing_defer_screen_`,
@@ -2207,12 +2211,22 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw(&self, scene: &gpui::Scene) {
+        let _trace = first_present_span();
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+        // Metal's presented handler lives in gpui_apple, which this fork leaves
+        // alone. Count this draw as a committed drawable so the 250 ms /
+        // three-draw safety can release `on_first_present` without claiming
+        // scanout.
+        crate::launch_trace::drawable_committed();
     }
 
     fn draw_composed(&self, scene: gpui::ComposedScene<'_>) {
-        crate::fast::composition::draw_composed(&self.0, scene)
+        // gpui-fast's composition path presents the window too, so it counts
+        // the same way `draw` does.
+        let _trace = first_present_span();
+        crate::fast::composition::draw_composed(&self.0, scene);
+        crate::launch_trace::drawable_committed();
     }
 
     fn enable_window_composition(&self) -> anyhow::Result<()> {
@@ -2621,6 +2635,14 @@ unsafe fn is_gpui_window(window: *mut AnyObject) -> bool {
         msg_send![window, isKindOfClass: WINDOW_CLASS]
             || msg_send![window, isKindOfClass: PANEL_CLASS]
     }
+}
+
+/// Traces the process's first window present, whichever draw path it takes.
+fn first_present_span() -> Option<crate::launch_trace::Span> {
+    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    FIRST
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+        .then(|| crate::launch_trace::Span::new("first_Window_present"))
 }
 
 pub(crate) unsafe fn get_window_state(object: &AnyObject) -> Rc<Mutex<MacWindowState>> {
