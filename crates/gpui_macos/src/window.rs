@@ -81,18 +81,21 @@ static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 static DROP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// What a window accepts dropped, besides Finder's legacy file list: browser
-/// image drags advertise URL and image types, while Finder search and iCloud may
-/// advertise file URLs or promises instead of the list. `public.png` and
-/// `public.tiff` are `NSPasteboardTypePNG` and `NSPasteboardTypeTIFF`.
-const DRAG_TYPES: [&str; 7] = [
-    "public.file-url",
-    "public.url",
-    "public.tiff",
-    "public.png",
-    "com.apple.pasteboard.promised-file-url",
-    "com.apple.filepromise",
-    "NSFilesPromisePboardType",
-];
+/// image drags advertise URL and image types, while Finder search may advertise a
+/// file URL instead of the list. `public.png` and `public.tiff` are
+/// `NSPasteboardTypePNG` and `NSPasteboardTypeTIFF`.
+///
+/// File promises aren't accepted. gpui takes a drag's paths when it enters the
+/// window, and a promise would have to be fulfilled then, on every hover.
+const DRAG_TYPES: [&str; 4] = ["public.file-url", "public.url", "public.tiff", "public.png"];
+
+/// Image data a drag carries, written to `path` only when it's dropped.
+struct PendingDropImage {
+    /// The pasteboard type holding the image.
+    pasteboard_type: &'static str,
+    /// Where the image will be written, which gpui already holds as the drag's path.
+    path: PathBuf,
+}
 
 static mut WINDOW_CLASS: *const AnyClass = ptr::null();
 static mut PANEL_CLASS: *const AnyClass = ptr::null();
@@ -671,6 +674,8 @@ pub(crate) struct MacWindowState {
     foreground_executor: ForegroundExecutor,
     background_executor: BackgroundExecutor,
     native_window: *mut AnyObject,
+    /// The image the drag over this window carries, until it's dropped or leaves.
+    pending_drop_image: Option<PendingDropImage>,
     /// Held hidden by `defer_initial_window_show` until the launch callback
     /// returns; `show_initial_windows` orders it and draws its first frame.
     initial_show_pending: bool,
@@ -1200,11 +1205,11 @@ impl MacWindow {
             ];
             crate::launch_trace::phase("NSWindow_init_end");
             assert!(!native_window.is_null());
+            let drag_types = DRAG_TYPES.map(NSString::from_str);
             #[expect(
                 deprecated,
                 reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
             )]
-            let drag_types = DRAG_TYPES.map(NSString::from_str);
             let mut registered: Vec<&NSString> = vec![NSFilenamesPboardType];
             registered.extend(drag_types.iter().map(|drag_type| &**drag_type));
             let () = msg_send![
@@ -1228,6 +1233,7 @@ impl MacWindow {
                 foreground_executor,
                 background_executor,
                 native_window,
+                pending_drop_image: None,
                 initial_show_pending,
                 native_view: NonNull::new_unchecked(native_view),
                 fast_composition: crate::fast::composition::MacComposition::new(
@@ -3878,7 +3884,9 @@ extern "C" fn dragging_entered(
     let is_source_window = is_drag_from_this_window(this, dragging_info);
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
-    let paths = external_paths_from_event(dragging_info);
+    let drag = external_paths_from_event(dragging_info);
+    let (paths, image) = drag.map_or((None, None), |drag| (Some(drag.paths), drag.image));
+    window_state.lock().pending_drop_image = image;
     if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
         && send_file_drop_event(window_state, event)
     {
@@ -3911,6 +3919,7 @@ extern "C" fn dragging_updated(
 
 extern "C" fn dragging_exited(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let window_state = unsafe { get_window_state(this) };
+    window_state.lock().pending_drop_image = None;
     send_file_drop_event(window_state, FileDropEvent::Exited);
 }
 
@@ -3921,14 +3930,36 @@ extern "C" fn perform_drag_operation(
 ) -> Bool {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
+    let image = window_state.lock().pending_drop_image.take();
+    if let Some(image) = image
+        && !write_drop_image(dragging_info, &image)
+    {
+        // The path gpui holds names nothing, so the drop doesn't happen.
+        send_file_drop_event(window_state, FileDropEvent::Exited);
+        return Bool::NO;
+    }
     send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
 }
 
-fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<ExternalPaths> {
+/// The paths a drag gives gpui, and the image to write when it's dropped.
+struct DragPaths {
+    paths: ExternalPaths,
+    image: Option<PendingDropImage>,
+}
+
+/// What a drag carries, read without writing anything: an image drag gets the path
+/// its data will be written to, by `write_drop_image`, when it's dropped.
+fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<DragPaths> {
     let pasteboard: *mut AnyObject = unsafe { msg_send![dragging_info, draggingPasteboard] };
     if pasteboard.is_null() {
         return None;
     }
+    let paths_only = |paths| {
+        Some(DragPaths {
+            paths: ExternalPaths(paths),
+            image: None,
+        })
+    };
 
     // Keep the legacy Finder representation first. It can contain several paths,
     // unlike the scalar UTI representations used by browser drags.
@@ -3944,54 +3975,63 @@ fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<ExternalPa
             .map(|file| PathBuf::from(file.to_string()))
             .collect();
         if !paths.is_empty() {
-            return Some(ExternalPaths(paths));
+            return paths_only(paths);
         }
-    }
-
-    // Promise boards can also contain a not-yet-materialized file URL. Ask the
-    // drag source to fulfill it before accepting that URL as an ordinary file.
-    if let Some(paths) = promised_paths(dragging_info, pasteboard)
-        && !paths.is_empty()
-    {
-        return Some(ExternalPaths(paths));
     }
 
     if let Some(path) = pasteboard_string(pasteboard, "public.file-url")
         .and_then(|file_url| file_url_path(&file_url))
     {
-        return Some(ExternalPaths(SmallVec::from_elem(path, 1)));
+        return paths_only(SmallVec::from_elem(path, 1));
     }
 
     // Pass a web URL through ExternalPaths as an opaque value; the app recognises it.
     if let Some(url) = pasteboard_string(pasteboard, "public.url")
         && (url.starts_with("http://") || url.starts_with("https://"))
     {
-        return Some(ExternalPaths(SmallVec::from_elem(PathBuf::from(url), 1)));
+        return paths_only(SmallVec::from_elem(PathBuf::from(url), 1));
     }
 
     for (pasteboard_type, extension) in [("public.png", "png"), ("public.tiff", "tiff")] {
-        let pasteboard_type = NSString::from_str(pasteboard_type);
-        let data: *mut AnyObject = unsafe { msg_send![pasteboard, dataForType: &*pasteboard_type] };
-        if data.is_null() {
-            continue;
-        }
-        let length: NSUInteger = unsafe { msg_send![data, length] };
-        let bytes: *const u8 = unsafe { msg_send![data, bytes] };
-        if length == 0 || length > 512 * 1024 * 1024 || bytes.is_null() {
-            continue;
-        }
-        let directory = unique_drop_directory();
-        if std::fs::create_dir_all(&directory).is_err() {
-            return None;
-        }
-        let path = directory.join(format!("image.{extension}"));
-        let contents = unsafe { std::slice::from_raw_parts(bytes, length) };
-        if std::fs::write(&path, contents).is_ok() {
-            return Some(ExternalPaths(SmallVec::from_elem(path, 1)));
+        if pasteboard_has_type(pasteboard, pasteboard_type) {
+            let path = unique_drop_directory().join(format!("image.{extension}"));
+            return Some(DragPaths {
+                paths: ExternalPaths(SmallVec::from_elem(path.clone(), 1)),
+                image: Some(PendingDropImage {
+                    pasteboard_type,
+                    path,
+                }),
+            });
         }
     }
 
     None
+}
+
+/// Writes a dropped image's data to the path gpui was given when the drag entered.
+/// Returns whether the file is there: the data may be empty, over 512 MiB, or gone.
+fn write_drop_image(dragging_info: *mut AnyObject, image: &PendingDropImage) -> bool {
+    let pasteboard: *mut AnyObject = unsafe { msg_send![dragging_info, draggingPasteboard] };
+    if pasteboard.is_null() {
+        return false;
+    }
+    let pasteboard_type = NSString::from_str(image.pasteboard_type);
+    let data: *mut AnyObject = unsafe { msg_send![pasteboard, dataForType: &*pasteboard_type] };
+    if data.is_null() {
+        return false;
+    }
+    let length: NSUInteger = unsafe { msg_send![data, length] };
+    let bytes: *const c_void = unsafe { msg_send![data, bytes] };
+    if length == 0 || length > 512 * 1024 * 1024 || bytes.is_null() {
+        return false;
+    }
+    let Some(directory) = image.path.parent() else {
+        return false;
+    };
+    // SAFETY: `bytes` points at `length` bytes the pasteboard's data object owns,
+    // and the data object outlives this call.
+    let contents = unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), length) };
+    std::fs::create_dir_all(directory).is_ok() && std::fs::write(&image.path, contents).is_ok()
 }
 
 /// The path a `file://` URL names.
@@ -4019,36 +4059,6 @@ fn pasteboard_has_type(pasteboard: *mut AnyObject, pasteboard_type: &str) -> boo
     let pasteboard_type = NSString::from_str(pasteboard_type);
     let contains: Bool = unsafe { msg_send![types, containsObject: &*pasteboard_type] };
     contains.as_bool()
-}
-
-fn promised_paths(
-    dragging_info: *mut AnyObject,
-    pasteboard: *mut AnyObject,
-) -> Option<SmallVec<[PathBuf; 2]>> {
-    if !pasteboard_has_type(pasteboard, "com.apple.pasteboard.promised-file-url")
-        && !pasteboard_has_type(pasteboard, "com.apple.filepromise")
-        && !pasteboard_has_type(pasteboard, "NSFilesPromisePboardType")
-    {
-        return None;
-    }
-
-    let directory = unique_drop_directory();
-    std::fs::create_dir_all(&directory).ok()?;
-    let directory_path = NSString::from_str(&directory.to_string_lossy());
-    let destination: *mut AnyObject =
-        unsafe { msg_send![class!(NSURL), fileURLWithPath: &*directory_path] };
-    if destination.is_null() {
-        return None;
-    }
-    let names: *mut NSArray<NSString> =
-        unsafe { msg_send![dragging_info, namesOfPromisedFilesDroppedAtDestination: destination] };
-    let names = unsafe { names.as_ref() }?;
-    Some(
-        names
-            .iter()
-            .map(|name| directory.join(name.to_string()))
-            .collect(),
-    )
 }
 
 fn unique_drop_directory() -> PathBuf {
