@@ -560,6 +560,19 @@ impl Platform for MacPlatform {
                 .load_ptr::<*mut c_void>(&*app_delegate)
                 .write(self_ptr);
 
+            // Finish launching now and run the app's callback directly. Left
+            // to `run`, AppKit sends `applicationDidFinishLaunching:` only
+            // once LaunchServices' open-application Apple Event has arrived,
+            // which is ~35ms of idle main thread between `finishLaunching`
+            // and the first window on an M4. `run` skips `finishLaunching`
+            // when it has already happened; the delegate's
+            // `did_finish_launching` still installs its observers when the
+            // event lands, and finds no callback left to run.
+            let _: () = msg_send![app, finishLaunching];
+            let callback = self.0.lock().finish_launching.take();
+            if let Some(callback) = callback {
+                callback();
+            }
             autoreleasepool(|_| {
                 let _: () = msg_send![app, run];
             });
