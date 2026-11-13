@@ -68,14 +68,31 @@ use std::{
     rc::{Rc, Weak},
     sync::{
         Arc, Once,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) const WINDOW_STATE_IVAR: &CStr = c"windowState";
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
+
+/// Numbers the temporary directories drops are written into.
+static DROP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// What a window accepts dropped, besides Finder's legacy file list: browser
+/// image drags advertise URL and image types, while Finder search and iCloud may
+/// advertise file URLs or promises instead of the list. `public.png` and
+/// `public.tiff` are `NSPasteboardTypePNG` and `NSPasteboardTypeTIFF`.
+const DRAG_TYPES: [&str; 7] = [
+    "public.file-url",
+    "public.url",
+    "public.tiff",
+    "public.png",
+    "com.apple.pasteboard.promised-file-url",
+    "com.apple.filepromise",
+    "NSFilesPromisePboardType",
+];
 
 static mut WINDOW_CLASS: *const AnyClass = ptr::null();
 static mut PANEL_CLASS: *const AnyClass = ptr::null();
@@ -1236,10 +1253,12 @@ impl MacWindow {
                 deprecated,
                 reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
             )]
+            let drag_types = DRAG_TYPES.map(NSString::from_str);
+            let mut registered: Vec<&NSString> = vec![NSFilenamesPboardType];
+            registered.extend(drag_types.iter().map(|drag_type| &**drag_type));
             let () = msg_send![
                 native_window,
-                registerForDraggedTypes:
-                    &*NSArray::from_slice(&[NSFilenamesPboardType])
+                registerForDraggedTypes: &*NSArray::from_slice(&registered)
             ];
             let () = msg_send![
                 native_window,
@@ -1467,8 +1486,7 @@ impl MacWindow {
             } else {
                 crate::launch_trace::phase("orderFront_begin");
                 if focus && show {
-                    let _: () =
-                        msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
+                    let _: () = msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
                 } else if show {
                     let _: () = msg_send![native_window, orderFront: ptr::null_mut::<AnyObject>()];
                 }
@@ -4003,26 +4021,142 @@ extern "C" fn perform_drag_operation(
 }
 
 fn external_paths_from_event(dragging_info: *mut AnyObject) -> Option<ExternalPaths> {
-    let mut paths = SmallVec::new();
     let pasteboard: *mut AnyObject = unsafe { msg_send![dragging_info, draggingPasteboard] };
     if pasteboard.is_null() {
         return None;
     }
+
+    // Keep the legacy Finder representation first. It can contain several paths,
+    // unlike the scalar UTI representations used by browser drags.
     #[expect(
         deprecated,
         reason = "File-drop decoding expects a property-list array of paths; replacing NSFilenamesPboardType requires migrating both registration and decoding to file URLs"
     )]
     let filenames: *mut NSArray<NSString> =
         unsafe { msg_send![pasteboard, propertyListForType: NSFilenamesPboardType] };
-    let filenames = unsafe { filenames.as_ref() }?;
-    for file in filenames {
-        let path = unsafe {
-            let f = file.UTF8String();
-            CStr::from_ptr(f).to_string_lossy().into_owned()
-        };
-        paths.push(PathBuf::from(path))
+    if let Some(filenames) = unsafe { filenames.as_ref() } {
+        let paths: SmallVec<[PathBuf; 2]> = filenames
+            .iter()
+            .map(|file| PathBuf::from(file.to_string()))
+            .collect();
+        if !paths.is_empty() {
+            return Some(ExternalPaths(paths));
+        }
     }
-    Some(ExternalPaths(paths))
+
+    // Promise boards can also contain a not-yet-materialized file URL. Ask the
+    // drag source to fulfill it before accepting that URL as an ordinary file.
+    if let Some(paths) = promised_paths(dragging_info, pasteboard)
+        && !paths.is_empty()
+    {
+        return Some(ExternalPaths(paths));
+    }
+
+    if let Some(path) = pasteboard_string(pasteboard, "public.file-url")
+        .and_then(|file_url| file_url_path(&file_url))
+    {
+        return Some(ExternalPaths(SmallVec::from_elem(path, 1)));
+    }
+
+    // Pass a web URL through ExternalPaths as an opaque value; the app recognises it.
+    if let Some(url) = pasteboard_string(pasteboard, "public.url")
+        && (url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return Some(ExternalPaths(SmallVec::from_elem(PathBuf::from(url), 1)));
+    }
+
+    for (pasteboard_type, extension) in [("public.png", "png"), ("public.tiff", "tiff")] {
+        let pasteboard_type = NSString::from_str(pasteboard_type);
+        let data: *mut AnyObject = unsafe { msg_send![pasteboard, dataForType: &*pasteboard_type] };
+        if data.is_null() {
+            continue;
+        }
+        let length: NSUInteger = unsafe { msg_send![data, length] };
+        let bytes: *const u8 = unsafe { msg_send![data, bytes] };
+        if length == 0 || length > 512 * 1024 * 1024 || bytes.is_null() {
+            continue;
+        }
+        let directory = unique_drop_directory();
+        if std::fs::create_dir_all(&directory).is_err() {
+            return None;
+        }
+        let path = directory.join(format!("image.{extension}"));
+        let contents = unsafe { std::slice::from_raw_parts(bytes, length) };
+        if std::fs::write(&path, contents).is_ok() {
+            return Some(ExternalPaths(SmallVec::from_elem(path, 1)));
+        }
+    }
+
+    None
+}
+
+/// The path a `file://` URL names.
+fn file_url_path(file_url: &str) -> Option<PathBuf> {
+    let file_url = NSString::from_str(file_url);
+    let url: *mut AnyObject = unsafe { msg_send![class!(NSURL), URLWithString: &*file_url] };
+    if url.is_null() {
+        return None;
+    }
+    let path: *mut NSString = unsafe { msg_send![url, path] };
+    unsafe { path.as_ref() }.map(|path| PathBuf::from(path.to_string()))
+}
+
+fn pasteboard_string(pasteboard: *mut AnyObject, pasteboard_type: &str) -> Option<String> {
+    let pasteboard_type = NSString::from_str(pasteboard_type);
+    let value: *mut NSString = unsafe { msg_send![pasteboard, stringForType: &*pasteboard_type] };
+    unsafe { value.as_ref() }.map(ToString::to_string)
+}
+
+fn pasteboard_has_type(pasteboard: *mut AnyObject, pasteboard_type: &str) -> bool {
+    let types: *mut AnyObject = unsafe { msg_send![pasteboard, types] };
+    if types.is_null() {
+        return false;
+    }
+    let pasteboard_type = NSString::from_str(pasteboard_type);
+    let contains: Bool = unsafe { msg_send![types, containsObject: &*pasteboard_type] };
+    contains.as_bool()
+}
+
+fn promised_paths(
+    dragging_info: *mut AnyObject,
+    pasteboard: *mut AnyObject,
+) -> Option<SmallVec<[PathBuf; 2]>> {
+    if !pasteboard_has_type(pasteboard, "com.apple.pasteboard.promised-file-url")
+        && !pasteboard_has_type(pasteboard, "com.apple.filepromise")
+        && !pasteboard_has_type(pasteboard, "NSFilesPromisePboardType")
+    {
+        return None;
+    }
+
+    let directory = unique_drop_directory();
+    std::fs::create_dir_all(&directory).ok()?;
+    let directory_path = NSString::from_str(&directory.to_string_lossy());
+    let destination: *mut AnyObject =
+        unsafe { msg_send![class!(NSURL), fileURLWithPath: &*directory_path] };
+    if destination.is_null() {
+        return None;
+    }
+    let names: *mut NSArray<NSString> =
+        unsafe { msg_send![dragging_info, namesOfPromisedFilesDroppedAtDestination: destination] };
+    let names = unsafe { names.as_ref() }?;
+    Some(
+        names
+            .iter()
+            .map(|name| directory.join(name.to_string()))
+            .collect(),
+    )
+}
+
+fn unique_drop_directory() -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "gpui-drop-{}-{timestamp}-{}",
+        std::process::id(),
+        DROP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 extern "C" fn conclude_drag_operation(this: &AnyObject, _: Sel, _: *mut AnyObject) {
