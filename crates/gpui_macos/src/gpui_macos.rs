@@ -9,6 +9,7 @@ mod display_link;
 mod events;
 mod fast;
 mod keyboard;
+mod launch_trace;
 mod pasteboard;
 mod system_notifications;
 
@@ -43,6 +44,7 @@ pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use window::*;
 
+pub use launch_trace::{on_first_drawable_completed, on_first_present};
 pub use platform::MacPlatform;
 
 trait BoolExt {
