@@ -570,16 +570,21 @@ impl Platform for MacPlatform {
             // when it has already happened; the delegate's
             // `did_finish_launching` still installs its observers when the
             // event lands, and finds no callback left to run.
-            crate::launch_trace::phase("finishLaunching_begin");
-            let _: () = msg_send![app, finishLaunching];
-            crate::launch_trace::phase("finishLaunching_end");
-            let callback = self.0.lock().finish_launching.take();
-            if let Some(callback) = callback {
-                crate::launch_trace::phase("app_callback_begin");
-                callback();
-                crate::launch_trace::phase("app_callback_end");
-                crate::window::show_initial_windows();
-            }
+            // Its own pool: the one around `run` drains only when `run`
+            // returns, and anything autoreleased here, a window the callback
+            // opens included, would stay retained until the app quits.
+            autoreleasepool(|_| {
+                crate::launch_trace::phase("finishLaunching_begin");
+                let _: () = msg_send![app, finishLaunching];
+                crate::launch_trace::phase("finishLaunching_end");
+                let callback = self.0.lock().finish_launching.take();
+                if let Some(callback) = callback {
+                    crate::launch_trace::phase("app_callback_begin");
+                    callback();
+                    crate::launch_trace::phase("app_callback_end");
+                    crate::window::show_initial_windows();
+                }
+            });
             autoreleasepool(|_| {
                 let _: () = msg_send![app, run];
             });
