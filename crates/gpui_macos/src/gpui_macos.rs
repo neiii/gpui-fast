@@ -46,6 +46,7 @@ pub(crate) use window::*;
 
 pub use launch_trace::{on_first_drawable_completed, on_first_present};
 pub use platform::MacPlatform;
+pub use window::defer_initial_window_show;
 
 trait BoolExt {
     fn to_objc(self) -> Bool;

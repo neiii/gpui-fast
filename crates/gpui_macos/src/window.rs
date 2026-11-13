@@ -658,6 +658,9 @@ pub(crate) struct MacWindowState {
     foreground_executor: ForegroundExecutor,
     background_executor: BackgroundExecutor,
     pub(crate) native_window: *mut AnyObject,
+    /// Held hidden by `defer_initial_window_show` until the launch callback
+    /// returns; `show_initial_windows` orders it and draws its first frame.
+    initial_show_pending: bool,
     pub(crate) native_view: NonNull<AnyObject>,
     pub(crate) fast_composition: crate::fast::composition::MacComposition,
     blurred_view: Option<*mut AnyObject>,
@@ -879,6 +882,9 @@ impl MacWindowState {
     /// `window_state` is the handle this state lives in; a Metal link holds it
     /// weakly to deliver frames.
     fn start_display_link(&mut self, window_state: &Rc<Mutex<MacWindowState>>) {
+        if self.initial_show_pending {
+            return;
+        }
         self.stop_display_link();
         if !self
             .native_window()
@@ -1033,6 +1039,85 @@ pub(crate) struct MacWindow(
     Option<Rc<MetalFrames>>,
 );
 
+thread_local! {
+    static DEFER_INITIAL_SHOW: Cell<bool> = const { Cell::new(false) };
+    static INITIAL_WINDOWS: std::cell::RefCell<Vec<(Weak<Mutex<MacWindowState>>, bool)>> =
+        Default::default();
+}
+
+/// Opt in during the application launch callback, before opening the first
+/// window. GPUI's callback must return (releasing its App borrow) before the
+/// fork orders and requests presentation of the synchronously built scene.
+/// Untabbed normal windows only; hidden/popup/tabbed-window behavior is unchanged.
+pub fn defer_initial_window_show() {
+    assert!(
+        crate::main_thread_marker().is_some(),
+        "initial show requires main thread"
+    );
+    DEFER_INITIAL_SHOW.with(|defer| defer.set(true));
+}
+
+/// Orders each window `defer_initial_window_show` held back and draws its first
+/// frame in the same `CATransaction`, so the window never appears empty.
+pub(crate) fn show_initial_windows() {
+    DEFER_INITIAL_SHOW.with(|defer| defer.set(false));
+    let windows = INITIAL_WINDOWS.with(|windows| mem::take(&mut *windows.borrow_mut()));
+    for (window, focus) in windows {
+        let Some(state) = window.upgrade() else {
+            continue;
+        };
+        let (native, callback) = {
+            let mut lock = state.lock();
+            if lock.closed.load(Ordering::Acquire) {
+                continue;
+            }
+            // The first frame presents with the transaction that orders the
+            // window, as `displayLayer:` frames do.
+            crate::fast::composition::set_presents_with_transaction(&mut lock, true);
+            (lock.native_window, lock.request_frame_callback.take())
+        };
+        // Own exactly this transaction. Never commit AppKit's implicit one.
+        // No state lock or App borrow may be held across AppKit callbacks.
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), begin];
+            crate::launch_trace::phase("initial_transaction_begin");
+            crate::launch_trace::phase("orderFront_begin");
+            if focus {
+                let _: () = msg_send![native, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
+            } else {
+                let _: () = msg_send![native, orderFront: ptr::null_mut::<AnyObject>()];
+            }
+            crate::launch_trace::phase("orderFront_end");
+        }
+        if let Some(mut callback) = callback {
+            callback(RequestFrameOptions::default());
+            state.lock().request_frame_callback = Some(callback);
+        }
+        state.lock().initial_show_pending = false;
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), commit];
+        }
+        crate::launch_trace::phase("initial_transaction_end");
+        let executor = {
+            let mut lock = state.lock();
+            crate::fast::composition::set_presents_with_transaction(&mut lock, false);
+            lock.foreground_executor.clone()
+        };
+        // The display link starts on the next main-thread turn. The state is
+        // an `Rc`, so it goes through the window's executor, not `DispatchQueue`.
+        executor
+            .spawn(async move {
+                if let Some(state) = window.upgrade() {
+                    let mut lock = state.lock();
+                    if !lock.closed.load(Ordering::Acquire) {
+                        lock.start_display_link(&state);
+                    }
+                }
+            })
+            .detach();
+    }
+}
+
 impl MacWindow {
     pub fn open(
         handle: AnyWindowHandle,
@@ -1061,6 +1146,10 @@ impl MacWindow {
         let fast_renderer_context = renderer_context.clone();
         autoreleasepool(|_| unsafe {
             let renderer = renderer::new_renderer(renderer_context, false, use_display_p3)?;
+            let initial_show_pending = show
+                && kind == WindowKind::Normal
+                && tabbing_identifier.is_none()
+                && DEFER_INITIAL_SHOW.with(Cell::get);
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
                 let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: Bool::YES];
@@ -1169,6 +1258,7 @@ impl MacWindow {
                 foreground_executor,
                 background_executor,
                 native_window,
+                initial_show_pending,
                 native_view: NonNull::new_unchecked(native_view),
                 fast_composition: crate::fast::composition::MacComposition::new(
                     fast_renderer_context,
@@ -1370,14 +1460,20 @@ impl MacWindow {
                 }
             }
 
-            crate::launch_trace::phase("orderFront_begin");
-            if focus && show {
-                let _: () =
-                    msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
-            } else if show {
-                let _: () = msg_send![native_window, orderFront: ptr::null_mut::<AnyObject>()];
+            if initial_show_pending {
+                INITIAL_WINDOWS.with(|windows| {
+                    windows.borrow_mut().push((Rc::downgrade(&window.0), focus));
+                });
+            } else {
+                crate::launch_trace::phase("orderFront_begin");
+                if focus && show {
+                    let _: () =
+                        msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
+                } else if show {
+                    let _: () = msg_send![native_window, orderFront: ptr::null_mut::<AnyObject>()];
+                }
+                crate::launch_trace::phase("orderFront_end");
             }
-            crate::launch_trace::phase("orderFront_end");
 
             // Set the initial position of the window to the specified origin.
             // Although we already specified the position using `initWithContentRect_styleMask_backing_defer_screen_`,
@@ -1461,6 +1557,8 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        // Invalidate deferred launch work before the asynchronous native close.
+        this.closed.store(true, Ordering::Release);
         // `accesskit_macos::SubclassingAdapter::for_window` strong-retains the
         // window's content view, and that content view keeps the `GPUIView` it
         // hosts alive. Together with the `Rc<Mutex<MacWindowState>>` parked in
@@ -3540,6 +3638,9 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
+    if lock.initial_show_pending {
+        return;
+    }
     if let Some(mut callback) = lock.request_frame_callback.take() {
         crate::fast::composition::set_presents_with_transaction(&mut lock, true);
         lock.stop_display_link();

@@ -580,6 +580,7 @@ impl Platform for MacPlatform {
                 crate::launch_trace::phase("app_callback_begin");
                 callback();
                 crate::launch_trace::phase("app_callback_end");
+                crate::window::show_initial_windows();
             }
             autoreleasepool(|_| {
                 let _: () = msg_send![app, run];
@@ -1399,6 +1400,7 @@ extern "C-unwind" fn did_finish_launching(this: &AnyObject, _: Sel, _: *mut AnyO
             crate::launch_trace::phase("app_callback_begin");
             callback();
             crate::launch_trace::phase("app_callback_end");
+            crate::window::show_initial_windows();
         }
     }
 }
