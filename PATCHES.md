@@ -1,11 +1,11 @@
 # The `faim` branch
 
 FAIM's GUI builds on gpui-fast (neiii/faim-http, ADR-0017). This branch is
-longbridge/gpui-fast at `v0.1.14` with NativeGPUI's `gpui_macos` patches ported onto
+longbridge/gpui-fast at `v0.1.17` with NativeGPUI's `gpui_macos` patches ported onto
 gpui-fast's `crates/gpui_macos`, one commit each. FAIM pins it by `rev`.
 
 NativeGPUI (Cafekery/NativeGPUI) wrote its seven patches against zed's `gpui_macos` at
-`90d8514` (9 Oct 2026). gpui-fast 0.1.14 imports zed at `d2a4fb6` (8 Nov 2026). In
+`90d8514` (9 Oct 2026). gpui-fast 0.1.14 imported zed at `d2a4fb6` (8 Nov 2026), and 0.1.17 at `78f5d74` (synced 16 Nov 2026). In
 between, zed moved `gpui_macos` from the `cocoa` crate to `objc2`, keeps window state
 in an `Rc`, and paces frames with a `CAMetalDisplayLink` on macOS 14 and later. None of
 the patches applied as written. Each one ported is rewritten for that code, keeping its
@@ -14,13 +14,15 @@ behaviour.
 ## How FAIM uses it
 
 `faim/gpui-fast-macos/Cargo.toml` is the manifest crates.io publishes for
-`gpui-fast-macos` 0.1.14 with four changes: its library path points at
+`gpui-fast-macos` 0.1.17 with four changes: its library path points at
 `crates/gpui_macos/src`, `publish = false`, the `include` list is gone (it names paths
 relative to the published crate), and it has a `[workspace]` of its own. Cargo's
 generated header gives way to a comment saying what the file is. An app replaces the published crate
 with `[patch.crates-io] gpui-fast-macos = { git = …, rev = … }` and keeps every other
 gpui-fast crate from crates.io, so there is one copy of `gpui`. The published source
-differs from `crates/gpui_macos/src` at `v0.1.14` only by a licence header line.
+differs from `crates/gpui_macos/src` at `v0.1.17` only by a licence header line.
+
+The branch moved from `v0.1.14` to `v0.1.17` on 2026-11-21 for longbridge/gpui-fast#140 (acrylic on Windows 11). Upstream had made `MacWindowState::native_window` `pub(crate)`; the two commits that add fields after it took that, and no other commit needed a change.
 
 ## Ported
 
